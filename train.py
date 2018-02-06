@@ -20,7 +20,8 @@ from tensorflow.python.client import timeline
 from wavenet import WaveNetModel, AudioReader, optimizer_factory
 
 BATCH_SIZE = 1
-DATA_DIRECTORY = './VCTK-Corpus'
+#DATA_DIRECTORY = '/cb/data/herman/VCTK-Corpus-Small/'
+DATA_DIRECTORY = '/cb/data/VCTK-Corpus/'
 LOGDIR_ROOT = './logdir'
 CHECKPOINT_EVERY = 50
 NUM_STEPS = int(1e5)
@@ -29,7 +30,7 @@ WAVENET_PARAMS = './wavenet_params.json'
 STARTED_DATESTRING = "{0:%Y-%m-%dT%H-%M-%S}".format(datetime.now())
 SAMPLE_SIZE = 100000
 L2_REGULARIZATION_STRENGTH = 0
-SILENCE_THRESHOLD = 0.3
+SILENCE_THRESHOLD = 0.01
 EPSILON = 0.001
 MOMENTUM = 0.9
 MAX_TO_KEEP = 5
@@ -215,6 +216,8 @@ def main():
         silence_threshold = args.silence_threshold if args.silence_threshold > \
                                                       EPSILON else None
         gc_enabled = args.gc_channels is not None
+        #import pdb
+        #pdb.set_trace()
         reader = AudioReader(
             args.data_dir,
             coord,
@@ -250,6 +253,8 @@ def main():
 
     if args.l2_regularization_strength == 0:
         args.l2_regularization_strength = None
+    #import ipdb 
+    #ipdb.set_trace()
     loss = net.loss(input_batch=audio_batch,
                     global_condition_batch=gc_id_batch,
                     l2_regularization_strength=args.l2_regularization_strength)
@@ -258,6 +263,10 @@ def main():
                     momentum=args.momentum)
     trainable = tf.trainable_variables()
     optim = optimizer.minimize(loss, var_list=trainable)
+
+#    with tf.name_scope("training_stats"):
+#        from zoo.utils.characterize import collect_sparsity_stats
+#        collect_sparsity_stats()
 
     # Set up logging for TensorBoard.
     writer = tf.summary.FileWriter(logdir)

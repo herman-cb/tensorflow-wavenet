@@ -403,6 +403,7 @@ class WaveNetModel(object):
         else:
             initial_channels = self.quantization_channels
 
+
         current_layer = self._create_causal_layer(current_layer)
 
         output_width = tf.shape(input_batch)[1] - self.receptive_field + 1
@@ -645,13 +646,14 @@ class WaveNetModel(object):
             # Cut off the last sample of network input to preserve causality.
             network_input_width = tf.shape(network_input)[1] - 1
             network_input = tf.slice(network_input, [0, 0, 0],
-                                     [-1, network_input_width, -1])
+                                     [-1, network_input_width, self.quantization_channels])
 
             raw_output = self._create_network(network_input, gc_embedding)
 
             with tf.name_scope('loss'):
                 # Cut off the samples corresponding to the receptive field
                 # for the first predicted sample.
+
                 target_output = tf.slice(
                     tf.reshape(
                         encoded,
@@ -662,6 +664,8 @@ class WaveNetModel(object):
                                            [-1, self.quantization_channels])
                 prediction = tf.reshape(raw_output,
                                         [-1, self.quantization_channels])
+                #import pdb
+                #pdb.set_trace()
                 loss = tf.nn.softmax_cross_entropy_with_logits(
                     logits=prediction,
                     labels=target_output)
