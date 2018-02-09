@@ -113,6 +113,9 @@ class WaveNetModel(object):
             self.filter_width, self.dilations, self.scalar_input,
             self.initial_filter_width)
         self.variables = self._create_variables()
+        self.queues_dict = dict()
+        self._create_and_init_queues()   # Fills up self.queues_dict and self.init_ops, we still
+                                         # need to execute the init_ops
 
     @staticmethod
     def calculate_receptive_field(filter_width, dilations, scalar_input,
@@ -447,24 +450,63 @@ class WaveNetModel(object):
 
         return conv2
 
-    def _create_generator(self, input_batch, global_condition_batch):
-        '''Construct an efficient incremental generator.'''
-        init_ops = []
-        push_ops = []
-        outputs = []
-        current_layer = input_batch
 
-        q = tf.FIFOQueue(
-            1,
-            dtypes=tf.float32,
-            shapes=(self.batch_size, self.quantization_channels))
+    def _get_queue(self, key, capacity, shapes):
+        if key in self.queues_dict:
+            return self.queues_dict[key]
+        self.queues_dict[key] = tf.FIFOQueue(capacity, tf.float32, shapes)
+        return self.queues_dict[key]
+
+
+    def _create_and_init_queues(self):
+        ''' TBD '''
+        init_ops = []
+
+        q = \
+            self.queues_dict['causal_layer'] = \
+            tf.FIFOQueue(1, tf.float32, (self.batch_size, self.quantization_channels))
+
         init = q.enqueue_many(
             tf.zeros((1, self.batch_size, self.quantization_channels)))
 
-        current_state = q.dequeue()
-        push = q.enqueue([current_layer])
         init_ops.append(init)
-        push_ops.append(push)
+
+        # Add all defined dilation layers.
+        with tf.name_scope('dilated_stack'):
+            for layer_index, dilation in enumerate(self.dilations):
+                with tf.name_scope('layer{}'.format(layer_index)):
+
+                    q = \
+                        self.queues_dict['layer{}'.format(layer_index)] = \
+                        tf.FIFOQueue(dilation, tf.float32, (self.batch_size, self.residual_channels))
+                    init = q.enqueue_many(
+                        tf.zeros((dilation, self.batch_size,
+                                  self.residual_channels)))
+
+                    init_ops.append(init)
+
+        self.init_ops = init_ops
+
+
+    def _create_generator(self, input_batch, global_condition_batch, cached_activations):
+        '''
+        Construct an efficient incremental generator.
+        input_batch is the current_sample for all waveforms in the batch
+        '''
+        push_ops = []
+        outputs = []
+        current_layer = input_batch
+        new_cached_activations = () # TODO: We need to return this
+
+        current_state = cached_activations[0]
+        new_cached_activations += (current_layer,)
+
+        # q = self._get_queue('causal_layer', 1, (self.batch_size,
+        #    self.quantization_channels))
+
+        # current_state = q.dequeue()
+        # push = q.enqueue([current_layer])
+        #push_ops.append(push)
 
         current_layer = self._generator_causal_layer(
                             current_layer, current_state)
@@ -474,25 +516,22 @@ class WaveNetModel(object):
             for layer_index, dilation in enumerate(self.dilations):
                 with tf.name_scope('layer{}'.format(layer_index)):
 
-                    q = tf.FIFOQueue(
-                        dilation,
-                        dtypes=tf.float32,
-                        shapes=(self.batch_size, self.residual_channels))
-                    init = q.enqueue_many(
-                        tf.zeros((dilation, self.batch_size,
-                                  self.residual_channels)))
+                    # q = self._get_queue('layer{}'.format(layer_index),
+                    #                              dilation,
+                    #                              (self.batch_size, self.residual_channels))
 
-                    current_state = q.dequeue()
-                    push = q.enqueue([current_layer])
-                    init_ops.append(init)
-                    push_ops.append(push)
+                    #current_state = q.dequeue()
+                    #push = q.enqueue([current_layer])
+                    #push_ops.append(push)
+                    current_state = cached_activations[layer_index + 1]  # +1 because 0 is for the
+                                                                         # causal layer
+                    new_cached_activations += (current_layer,)
 
                     output, current_layer = self._generator_dilation_layer(
                         current_layer, current_state, layer_index, dilation,
                         global_condition_batch)
                     outputs.append(output)
-        self.init_ops = init_ops
-        self.push_ops = push_ops
+        # self.push_ops = push_ops
 
         with tf.name_scope('postprocessing'):
             variables = self.variables['postprocessing']
@@ -517,7 +556,7 @@ class WaveNetModel(object):
             if self.use_biases:
                 conv2 = conv2 + b2
 
-        return conv2
+        return conv2, new_cached_activations
 
     def _one_hot(self, input_batch):
         '''One-hot encodes the waveform amplitudes.
@@ -575,7 +614,8 @@ class WaveNetModel(object):
         '''Computes the probability distribution of the next sample based on
         all samples in the input waveform.
         If you want to generate audio by feeding the output of the network back
-        as an input, see predict_proba_incremental for a faster alternative.'''
+        as an input, see predict_proba_incremental for a faster alternative.
+        '''
         with tf.name_scope(name):
             if self.scalar_input:
                 encoded = tf.cast(waveform, tf.float32)
@@ -595,11 +635,14 @@ class WaveNetModel(object):
                 [1, self.quantization_channels])
             return tf.reshape(last, [-1])
 
-    def predict_proba_incremental(self, waveform, global_condition=None,
+    def predict_proba_incremental(self, window, cached_activations, global_condition=None,
                                   name='wavenet'):
         '''Computes the probability distribution of the next sample
         incrementally, based on a single sample and all previously passed
-        samples.'''
+        samples.
+        Note: The list `cached_acvtivations` should have `1 + sum(self.dilations)`
+        number of elements
+        '''
         if self.filter_width > 2:
             raise NotImplementedError("Incremental generation does not "
                                       "support filter_width > 2.")
@@ -607,10 +650,11 @@ class WaveNetModel(object):
             raise NotImplementedError("Incremental generation does not "
                                       "support scalar input yet.")
         with tf.name_scope(name):
-            encoded = tf.one_hot(waveform, self.quantization_channels)
+            encoded = tf.one_hot(window, self.quantization_channels)
             encoded = tf.reshape(encoded, [-1, self.quantization_channels])
             gc_embedding = self._embed_gc(global_condition)
-            raw_output = self._create_generator(encoded, gc_embedding)
+            raw_output, new_cached_activations  = \
+                    self._create_generator(encoded, gc_embedding, cached_activations)
             out = tf.reshape(raw_output, [-1, self.quantization_channels])
             proba = tf.cast(
                 tf.nn.softmax(tf.cast(out, tf.float64)), tf.float32)
@@ -618,7 +662,7 @@ class WaveNetModel(object):
                 proba,
                 [tf.shape(proba)[0] - 1, 0],
                 [1, self.quantization_channels])
-            return tf.reshape(last, [-1])
+            return tf.reshape(last, [-1]), new_cached_activations
 
     def loss(self,
              input_batch,
